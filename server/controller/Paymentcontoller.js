@@ -1,0 +1,499 @@
+import Plan from "../model/Plan.js";
+import Payment from "../model/payment.js";
+import stripePackage from "stripe";
+
+// Initialize Stripe
+function getStripe() {
+  const stripeSecret =
+    process.env.STRIPE_SECRET_KEY ||
+    process.env.secret_key ||
+    process.env.SECRET_KEY;
+
+  if (!stripeSecret) return null;
+  return stripePackage(stripeSecret);
+}
+
+// ============================================
+// Create Stripe Checkout Session
+// ============================================
+export const createCheckoutSession = async (req, res) => {
+  try {
+    const { planId } = req.params;
+    if (!planId) return res.status(400).json({ success: false, message: "planId is required" });
+
+    const plan = await Plan.findById(planId);
+
+    if (!plan) return res.status(404).json({ success: false, message: "Plan not found" });
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(500).json({ success: false, message: "Stripe secret key missing" });
+
+    const amount = Math.round(parseFloat(plan.Price) * 100);
+    const currency = (process.env.STRIPE_CURRENCY || "inr").toLowerCase();
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+
+    let stripePriceId = plan.stripePriceId;
+
+    // If no Stripe price ID exists, create a recurring price
+    if (!stripePriceId) {
+      try {
+        // Create or get Stripe product
+        let stripeProductId = plan.stripeProductId;
+        if (!stripeProductId) {
+          const product = await stripe.products.create({
+            name: plan.PlanName,
+            description: plan.Description || `${plan.BillingPeriod} subscription plan`,
+            metadata: {
+              planId: plan._id.toString(),
+              planNumber: plan.Id,
+            },
+          });
+          stripeProductId = product.id;
+          await Plan.findByIdAndUpdate(planId, { stripeProductId });
+        }
+
+        // Create recurring price
+        const recurringPrice = await stripe.prices.create({
+          product: stripeProductId,
+          unit_amount: amount,
+          currency,
+          recurring: {
+            interval: plan.BillingPeriod.toLowerCase() === "monthly" ? "month" : "year",
+            interval_count: plan.BillingInterval,
+          },
+          metadata: {
+            planId: plan._id.toString(),
+          },
+        });
+
+        stripePriceId = recurringPrice.id;
+        await Plan.findByIdAndUpdate(planId, { stripePriceId });
+      } catch (stripeError) {
+        console.error("❌ Error creating Stripe price:", stripeError);
+        return res.status(500).json({ success: false, message: "Failed to create Stripe price" });
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price: stripePriceId,
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: `${frontendUrl}/success?planId=${planId}&sessionId={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/error?cancelled=true`,
+      metadata: {
+        planId: plan._id.toString(),
+      },
+    });
+
+    return res.status(201).json({
+      success: true,
+      sessionUrl: session.url,
+      sessionId: session.id,
+    });
+
+  } catch (err) {
+    console.error("❌ createCheckoutSession:", err);
+    return res.status(500).json({ success: false, message: "Failed to create Stripe session" });
+  }
+};
+
+// ============================================
+// Get Payment History
+// ============================================
+export const getPaymentHistory = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const payments = await Payment.find({ user: userId })
+      .populate("plan", "PlanName Price BillingPeriod")
+      .populate("user", "email fullName")
+      .sort({ createdAt: -1 });
+
+    return res.json({
+      success: true,
+      payments,
+      count: payments.length,
+    });
+
+  } catch (err) {
+    console.error("❌ getPaymentHistory:", err);
+    return res.status(500).json({ success: false, message: "Failed to retrieve payment history" });
+  }
+};
+
+// ============================================
+// Get Stripe Payment Session Details
+// ============================================
+export const getPaymentSession = async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { planId } = req.query;
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    let plan = null;
+    if (planId) {
+      plan = await Plan.findById(planId);
+    }
+
+    return res.json({ success: true, session, plan });
+
+  } catch (err) {
+    console.error("❌ getPaymentSession:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch payment session" });
+  }
+};
+
+// ============================================
+// Save Frontend Stripe Session and Prevent Duplicates
+// ============================================
+export const saveFrontendSession = async (req, res) => {
+  try {
+    const { session, plan: planFromClient } = req.body || {};
+
+    const planId =
+      session?.metadata?.planId ||
+      planFromClient?._id;
+
+    if (!planId) {
+      return res.status(400).json({ success: false, message: "planId missing" });
+    }
+
+    const plan = await Plan.findById(planId);
+    if (!plan) return res.status(404).json({ success: false, message: "Plan not found" });
+
+    const stripe = getStripe();
+    const sessionId = session?.id || null;
+    const paymentIntentId = session?.payment_intent || null;
+
+    const amount = session?.amount_total ? session.amount_total / 100 : plan.Price;
+    const currency = session?.currency || process.env.STRIPE_CURRENCY || "inr";
+    const status = session?.payment_status === "paid" ? "succeeded" : "pending";
+    const userId = null;
+
+    // Initialize paymentData with all required fields
+    const paymentData = {
+      plan: planId,
+      amount: Number(amount) || 0,
+      currency,
+      status,
+      stripeCheckoutSessionId: sessionId || null,
+      stripePaymentIntentId: paymentIntentId || null,
+      stripePaymentMethodId: session?.payment_method?.id || null,
+      stripeChargeId: null,
+      cardBrand: null,
+      cardFunding: "unknown",
+      cardLast4: null,
+      cardExpMonth: null,
+      cardExpYear: null,
+      stripeRaw: session || {},
+    };
+
+    // Extract card details from session if available
+    if (session?.payment_method?.card) {
+      const card = session.payment_method.card;
+      paymentData.cardBrand = card.brand || null;
+      paymentData.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
+      paymentData.cardLast4 = card.last4 || null;
+      paymentData.cardExpMonth = card.exp_month || null;
+      paymentData.cardExpYear = card.exp_year || null;
+    }
+
+    // If we have a payment intent, retrieve it to get full charge & card details
+    if (stripe && paymentIntentId) {
+      try {
+        const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+        if (pi) {
+          // Update amount and currency from PaymentIntent if available
+          if (pi.amount) paymentData.amount = pi.amount / 100;
+          if (pi.currency) paymentData.currency = pi.currency;
+          if (pi.status === "succeeded") paymentData.status = "succeeded";
+
+          const charge = pi.charges?.data?.[0];
+          if (charge) {
+            paymentData.stripeChargeId = charge.id;
+            paymentData.stripePaymentMethodId = charge.payment_method || pi.payment_method;
+
+            const card = charge.payment_method_details?.card;
+            if (card) {
+              paymentData.cardBrand = card.brand || paymentData.cardBrand;
+              paymentData.cardFunding = card.funding ? normalizeFunding(card.funding) : paymentData.cardFunding;
+              paymentData.cardLast4 = card.last4 || paymentData.cardLast4;
+              paymentData.cardExpMonth = card.exp_month || paymentData.cardExpMonth;
+              paymentData.cardExpYear = card.exp_year || paymentData.cardExpYear;
+            }
+          }
+        }
+      } catch (piErr) {
+        console.warn(`⚠️ Could not retrieve PaymentIntent ${paymentIntentId}:`, piErr.message);
+      }
+    }
+
+    // Prevent duplicate creation using atomic upsert
+    const filter = {
+      $or: [
+        paymentIntentId ? { stripePaymentIntentId: paymentIntentId } : null,
+        sessionId ? { stripeCheckoutSessionId: sessionId } : null,
+        { plan: planId, amount: paymentData.amount }
+      ].filter(Boolean)
+    };
+
+    const payment = await Payment.findOneAndUpdate(
+      filter,
+      { $set: paymentData },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    console.log(`✅ Frontend save: Payment record ${payment._id ? "created" : "updated"} with all fields for plan ${planId}`);
+
+    if (status === "succeeded") {
+      // Optional: Update plan status if needed
+      // await Plan.findByIdAndUpdate(planId, { planStatus: "Active" });
+    }
+
+    return res.json({ success: true, payment, plan });
+
+  } catch (err) {
+    console.error("❌ saveFrontendSession:", err);
+    return res.status(500).json({ success: false, message: "Failed to save session", error: err.message });
+  }
+};
+
+// ============================================
+// Stripe Webhook Handler
+// ============================================
+export const handleWebhook = async (req, res) => {
+  const sig = req.headers["stripe-signature"];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error("❌ STRIPE_WEBHOOK_SECRET not configured");
+    return res.status(500).json({ success: false, message: "Webhook secret not configured" });
+  }
+
+  if (!sig) {
+    console.error("❌ No Stripe signature in webhook request");
+    return res.status(400).json({ success: false, message: "Missing Stripe signature" });
+  }
+
+  let event;
+  const stripe = getStripe();
+
+  try {
+    // Verify signature using raw body (req.rawBody is set by express.raw() middleware)
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    console.log(`✅ Webhook signature verified, event type: ${event.type}`);
+  } catch (err) {
+    console.error(`❌ Webhook signature verification failed: ${err.message}`);
+    return res.status(400).json({ success: false, message: "Signature verification failed" });
+  }
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event.data.object);
+        break;
+
+      case "payment_intent.succeeded":
+        await handlePaymentIntentSucceeded(event.data.object);
+        break;
+
+      case "payment_intent.payment_failed":
+        await handlePaymentIntentFailed(event.data.object);
+        break;
+
+      default:
+        console.log(`ℹ️ Unhandled webhook event type: ${event.type}`);
+    }
+
+    return res.json({ success: true, received: true });
+  } catch (err) {
+    console.error(`❌ Error processing webhook event ${event.type}:`, err && err.stack ? err.stack : err);
+    return res.status(500).json({ success: false, message: "Error processing webhook" });
+  }
+};
+
+// Handle checkout.session.completed event
+async function handleCheckoutSessionCompleted(session) {
+  try {
+    console.log(`📦 Processing checkout.session.completed: ${session.id}`);
+
+    const planId = session.metadata?.planId;
+    const paymentIntentId = session.payment_intent;
+
+    if (!planId) {
+      console.warn("⚠️ checkout.session.completed: no planId in metadata");
+      return;
+    }
+
+    // Fetch plan from DB
+    const plan = await Plan.findById(planId);
+    if (!plan) {
+      console.warn(`⚠️ Plan ${planId} not found for checkout session ${session.id}`);
+      return;
+    }
+
+    // Normalize payment data
+    const amountMajor = session.amount_total ? session.amount_total / 100 : plan.Price;
+    const currency = session.currency || process.env.STRIPE_CURRENCY || "inr";
+    const status = session.payment_status === "paid" ? "confirmed" : "pending";
+
+    // Initialize paymentData with ALL fields set to defaults to avoid null values
+    const paymentData = {
+      plan: plan._id,
+      amount: Number(amountMajor) || 0,
+      currency,
+      status,
+      stripeCheckoutSessionId: session.id,
+      stripePaymentIntentId: paymentIntentId || null,
+      stripePaymentMethodId: null,
+      stripeChargeId: null,
+      cardBrand: null,
+      cardFunding: "unknown",
+      cardLast4: null,
+      cardExpMonth: null,
+      cardExpYear: null,
+      stripeRaw: session,
+    };
+
+    // Enrich with PaymentIntent data if available
+    if (paymentIntentId && stripe) {
+      try {
+        const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+        if (pi) {
+          // Update amount and currency from PaymentIntent if available
+          if (pi.amount) paymentData.amount = pi.amount / 100;
+          if (pi.currency) paymentData.currency = pi.currency;
+          if (pi.status === "succeeded") paymentData.status = "succeeded";
+
+          const charge = pi.charges?.data?.[0];
+          if (charge) {
+            paymentData.stripeChargeId = charge.id;
+            paymentData.stripePaymentMethodId = charge.payment_method || pi.payment_method;
+            const card = charge.payment_method_details?.card;
+            if (card) {
+              paymentData.cardBrand = card.brand || null;
+              paymentData.cardLast4 = card.last4 || null;
+              paymentData.cardExpMonth = card.exp_month || null;
+              paymentData.cardExpYear = card.exp_year || null;
+              paymentData.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
+            }
+          }
+        }
+      } catch (piErr) {
+        console.warn(`⚠️ Could not retrieve PaymentIntent ${paymentIntentId}:`, piErr && piErr.message ? piErr.message : piErr);
+      }
+    }
+
+    // Upsert payment: use $or to find by payment intent or session id
+    const filter = { $or: [{ stripePaymentIntentId: paymentIntentId }, { stripeCheckoutSessionId: session.id }] };
+    const result = await Payment.findOneAndUpdate(filter, { $set: paymentData }, { upsert: true, new: true, setDefaultsOnInsert: true, rawResult: true });
+
+    if (result && result.lastErrorObject && result.lastErrorObject.updatedExisting === false) {
+      console.log(`✅ Webhook: Created new Payment record for checkout session ${session.id}`);
+    } else {
+      console.log(`ℹ️ Webhook: Updated existing Payment record for checkout session ${session.id}`);
+    }
+
+    // Mark plan as Active if payment confirmed
+    if (status === "confirmed") {
+      // Optional: update plan status
+      console.log(`✔ Webhook: Plan ${planId} payment confirmed`);
+    }
+  } catch (err) {
+    console.error("❌ handleCheckoutSessionCompleted error:", err && err.stack ? err.stack : err);
+  }
+}
+
+// Handle payment_intent.succeeded event
+async function handlePaymentIntentSucceeded(paymentIntent) {
+  try {
+    console.log(`💳 Processing payment_intent.succeeded: ${paymentIntent.id}`);
+
+    // Try to find payment by payment intent id or by charge
+    const chargeId = paymentIntent.charges?.data?.[0]?.id;
+    let payment = await Payment.findOne({
+      $or: [
+        { stripePaymentIntentId: paymentIntent.id },
+        { stripeChargeId: chargeId },
+      ],
+    });
+
+    if (!payment) {
+      console.warn(`⚠️ payment_intent.succeeded: Payment record not found for PI ${paymentIntent.id}`);
+      return;
+    }
+
+    // Update payment status and ALL charge details
+    payment.status = "succeeded";
+    payment.stripePaymentIntentId = paymentIntent.id;
+
+    const charge = paymentIntent.charges?.data?.[0];
+    if (charge) {
+      payment.stripeChargeId = charge.id;
+      payment.stripePaymentMethodId = charge.payment_method || paymentIntent.payment_method;
+      const card = charge.payment_method_details?.card;
+      if (card) {
+        payment.cardBrand = card.brand || null;
+        payment.cardLast4 = card.last4 || null;
+        payment.cardExpMonth = card.exp_month || null;
+        payment.cardExpYear = card.exp_year || null;
+        payment.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
+      }
+    }
+
+    // Update amount and currency from PaymentIntent if not already set
+    if (paymentIntent.amount && !payment.amount) {
+      payment.amount = paymentIntent.amount / 100;
+    }
+    if (paymentIntent.currency && !payment.currency) {
+      payment.currency = paymentIntent.currency;
+    }
+
+    await payment.save();
+    console.log(`✅ Webhook: Updated Payment ${payment._id} to succeeded status with all card details`);
+
+    // Update plan - optional status update
+    if (payment.plan) {
+      console.log(`✔ Webhook: Plan payment succeeded for ${payment.plan}`);
+    }
+  } catch (err) {
+    console.error("❌ handlePaymentIntentSucceeded error:", err && err.stack ? err.stack : err);
+  }
+}
+
+// Handle payment_intent.payment_failed event
+async function handlePaymentIntentFailed(paymentIntent) {
+  try {
+    console.log(`❌ Processing payment_intent.payment_failed: ${paymentIntent.id}`);
+
+    const payment = await Payment.findOne({ stripePaymentIntentId: paymentIntent.id });
+    if (!payment) {
+      console.warn(`⚠️ payment_intent.payment_failed: Payment record not found for PI ${paymentIntent.id}`);
+      return;
+    }
+
+    payment.status = "failed";
+    await payment.save();
+    console.log(`✅ Webhook: Updated Payment ${payment._id} to failed status`);
+  } catch (err) {
+    console.error("❌ handlePaymentIntentFailed error:", err && err.stack ? err.stack : err);
+  }
+}
+
+// Helper to normalize card funding
+function normalizeFunding(f) {
+  if (!f) return "unknown";
+  const s = String(f).toLowerCase();
+  if (["credit", "debit", "prepaid"].includes(s)) return s;
+  return "unknown";
+}
+
