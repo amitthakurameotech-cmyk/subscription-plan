@@ -289,9 +289,15 @@ export const saveFrontendSession = async (req, res) => {
   }
 };
 
-// ============================================
-// Stripe Webhook Handler
-// ============================================
+// Helper to normalize card funding
+function normalizeFunding(f) {
+  if (!f) return "unknown";
+  const s = String(f).toLowerCase();
+  if (["credit", "debit", "prepaid"].includes(s)) return s;
+  return "unknown";
+}
+
+// Main webhook entry
 export const handleWebhook = async (req, res) => {
   const sig = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
@@ -306,26 +312,27 @@ export const handleWebhook = async (req, res) => {
     return res.status(400).json({ success: false, message: "Missing Stripe signature" });
   }
 
-  let event;
-  const stripe = getStripe();
+  const stripe = getStripe(); // get Stripe instance here and pass into handlers if needed
 
+  let event;
   try {
-    // Verify signature using raw body (req.rawBody is set by express.raw() middleware)
-    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    // req.body must be the raw Buffer — ensure route used express.raw()
+    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
+    event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
     console.log(`✅ Webhook signature verified, event type: ${event.type}`);
   } catch (err) {
-    console.error(`❌ Webhook signature verification failed: ${err.message}`);
-    return res.status(400).json({ success: false, message: "Signature verification failed" });
+    console.error(`❌ Webhook signature verification failed: ${err && err.message ? err.message : err}`);
+    return res.status(400).json({ success: false, message: "Signature verification failed", error: err && err.message ? err.message : String(err) });
   }
 
   try {
     switch (event.type) {
       case "checkout.session.completed":
-        await handleCheckoutSessionCompleted(event.data.object);
+        await handleCheckoutSessionCompleted(event.data.object, stripe);
         break;
 
       case "payment_intent.succeeded":
-        await handlePaymentIntentSucceeded(event.data.object);
+        await handlePaymentIntentSucceeded(event.data.object, stripe);
         break;
 
       case "payment_intent.payment_failed":
@@ -344,15 +351,16 @@ export const handleWebhook = async (req, res) => {
 };
 
 // Handle checkout.session.completed event
-async function handleCheckoutSessionCompleted(session) {
+async function handleCheckoutSessionCompleted(session, stripe) {
   try {
     console.log(`📦 Processing checkout.session.completed: ${session.id}`);
 
     const planId = session.metadata?.planId;
-    const paymentIntentId = session.payment_intent;
+    const paymentIntentId = session.payment_intent || null;
 
     if (!planId) {
       console.warn("⚠️ checkout.session.completed: no planId in metadata");
+      // still upsert a payment row if you want, but return for now
       return;
     }
 
@@ -364,18 +372,17 @@ async function handleCheckoutSessionCompleted(session) {
     }
 
     // Normalize payment data
-    const amountMajor = session.amount_total ? session.amount_total / 100 : plan.Price;
-    const currency = session.currency || process.env.STRIPE_CURRENCY || "inr";
-    const status = session.payment_status === "paid" ? "confirmed" : "pending";
+    const amountMajor = typeof session.amount_total === "number" ? session.amount_total / 100 : (plan.Price || 0);
+    const currency = (session.currency || process.env.STRIPE_CURRENCY || "inr").toLowerCase();
+    const status = session.payment_status === "paid" ? "succeeded" : "pending";
 
-    // Initialize paymentData with ALL fields set to defaults to avoid null values
     const paymentData = {
       plan: plan._id,
       amount: Number(amountMajor) || 0,
       currency,
       status,
       stripeCheckoutSessionId: session.id,
-      stripePaymentIntentId: paymentIntentId || null,
+      stripePaymentIntentId: paymentIntentId,
       stripePaymentMethodId: null,
       stripeChargeId: null,
       cardBrand: null,
@@ -391,8 +398,7 @@ async function handleCheckoutSessionCompleted(session) {
       try {
         const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
         if (pi) {
-          // Update amount and currency from PaymentIntent if available
-          if (pi.amount) paymentData.amount = pi.amount / 100;
+          if (typeof pi.amount === "number") paymentData.amount = pi.amount / 100;
           if (pi.currency) paymentData.currency = pi.currency;
           if (pi.status === "succeeded") paymentData.status = "succeeded";
 
@@ -415,20 +421,28 @@ async function handleCheckoutSessionCompleted(session) {
       }
     }
 
-    // Upsert payment: use $or to find by payment intent or session id
-    const filter = { $or: [{ stripePaymentIntentId: paymentIntentId }, { stripeCheckoutSessionId: session.id }] };
-    const result = await Payment.findOneAndUpdate(filter, { $set: paymentData }, { upsert: true, new: true, setDefaultsOnInsert: true, rawResult: true });
+    // Build filter only with defined keys
+    const or = [];
+    if (paymentIntentId) or.push({ stripePaymentIntentId: paymentIntentId });
+    if (session.id) or.push({ stripeCheckoutSessionId: session.id });
 
-    if (result && result.lastErrorObject && result.lastErrorObject.updatedExisting === false) {
-      console.log(`✅ Webhook: Created new Payment record for checkout session ${session.id}`);
-    } else {
-      console.log(`ℹ️ Webhook: Updated existing Payment record for checkout session ${session.id}`);
+    const filter = or.length ? { $or: or } : { stripeCheckoutSessionId: session.id };
+
+    // Upsert payment
+    const updated = await Payment.findOneAndUpdate(
+      filter,
+      { $set: paymentData, $setOnInsert: { createdAt: new Date() } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    if (updated) {
+      console.log(`✅ Webhook: Upserted Payment record for checkout session ${session.id} (id=${updated._id})`);
     }
 
-    // Mark plan as Active if payment confirmed
-    if (status === "confirmed") {
-      // Optional: update plan status
-      console.log(`✔ Webhook: Plan ${planId} payment confirmed`);
+    // Optionally update plan status if needed
+    if (paymentData.status === "succeeded") {
+      console.log(`✔ Webhook: Plan ${planId} payment succeeded`);
+      // e.g. await Plan.findByIdAndUpdate(planId, { status: 'active' });
     }
   } catch (err) {
     console.error("❌ handleCheckoutSessionCompleted error:", err && err.stack ? err.stack : err);
@@ -436,32 +450,65 @@ async function handleCheckoutSessionCompleted(session) {
 }
 
 // Handle payment_intent.succeeded event
-async function handlePaymentIntentSucceeded(paymentIntent) {
+async function handlePaymentIntentSucceeded(paymentIntent, stripe) {
   try {
     console.log(`💳 Processing payment_intent.succeeded: ${paymentIntent.id}`);
 
-    // Try to find payment by payment intent id or by charge
-    const chargeId = paymentIntent.charges?.data?.[0]?.id;
+    const chargeId = paymentIntent.charges?.data?.[0]?.id || null;
+
     let payment = await Payment.findOne({
       $or: [
         { stripePaymentIntentId: paymentIntent.id },
-        { stripeChargeId: chargeId },
+        ...(chargeId ? [{ stripeChargeId: chargeId }] : []),
       ],
     });
 
+    // If no payment found, try to create basic payment from PI (use metadata if present)
     if (!payment) {
-      console.warn(`⚠️ payment_intent.succeeded: Payment record not found for PI ${paymentIntent.id}`);
+      console.warn(`⚠️ payment_intent.succeeded: Payment record not found for PI ${paymentIntent.id}. Creating new record from PI metadata if possible.`);
+
+      const planId = paymentIntent.metadata?.planId || null;
+      const amount = typeof paymentIntent.amount === "number" ? paymentIntent.amount / 100 : 0;
+      const currency = paymentIntent.currency || process.env.STRIPE_CURRENCY || "inr";
+
+      const newPayment = new Payment({
+        plan: planId ? mongoose.Types.ObjectId(planId) : null,
+        amount,
+        currency,
+        status: "succeeded",
+        stripePaymentIntentId: paymentIntent.id,
+        stripeChargeId: chargeId,
+        stripePaymentMethodId: paymentIntent.payment_method || null,
+        stripeRaw: paymentIntent,
+      });
+
+      const charge = paymentIntent.charges?.data?.[0];
+      if (charge) {
+        const card = charge.payment_method_details?.card;
+        if (card) {
+          newPayment.cardBrand = card.brand || null;
+          newPayment.cardLast4 = card.last4 || null;
+          newPayment.cardExpMonth = card.exp_month || null;
+          newPayment.cardExpYear = card.exp_year || null;
+          newPayment.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
+        }
+      }
+
+      payment = await newPayment.save();
+      console.log(`✅ Webhook: Created new Payment ${payment._id} from PaymentIntent ${paymentIntent.id}`);
       return;
     }
 
-    // Update payment status and ALL charge details
+    // Update existing payment details
     payment.status = "succeeded";
     payment.stripePaymentIntentId = paymentIntent.id;
+    if (!payment.amount && paymentIntent.amount) payment.amount = paymentIntent.amount / 100;
+    if (!payment.currency && paymentIntent.currency) payment.currency = paymentIntent.currency;
 
     const charge = paymentIntent.charges?.data?.[0];
     if (charge) {
       payment.stripeChargeId = charge.id;
-      payment.stripePaymentMethodId = charge.payment_method || paymentIntent.payment_method;
+      payment.stripePaymentMethodId = charge.payment_method || paymentIntent.payment_method || payment.stripePaymentMethodId;
       const card = charge.payment_method_details?.card;
       if (card) {
         payment.cardBrand = card.brand || null;
@@ -472,21 +519,8 @@ async function handlePaymentIntentSucceeded(paymentIntent) {
       }
     }
 
-    // Update amount and currency from PaymentIntent if not already set
-    if (paymentIntent.amount && !payment.amount) {
-      payment.amount = paymentIntent.amount / 100;
-    }
-    if (paymentIntent.currency && !payment.currency) {
-      payment.currency = paymentIntent.currency;
-    }
-
     await payment.save();
-    console.log(`✅ Webhook: Updated Payment ${payment._id} to succeeded status with all card details`);
-
-    // Update plan - optional status update
-    if (payment.plan) {
-      console.log(`✔ Webhook: Plan payment succeeded for ${payment.plan}`);
-    }
+    console.log(`✅ Webhook: Updated Payment ${payment._id} to succeeded`);
   } catch (err) {
     console.error("❌ handlePaymentIntentSucceeded error:", err && err.stack ? err.stack : err);
   }
@@ -496,26 +530,16 @@ async function handlePaymentIntentSucceeded(paymentIntent) {
 async function handlePaymentIntentFailed(paymentIntent) {
   try {
     console.log(`❌ Processing payment_intent.payment_failed: ${paymentIntent.id}`);
-
     const payment = await Payment.findOne({ stripePaymentIntentId: paymentIntent.id });
     if (!payment) {
       console.warn(`⚠️ payment_intent.payment_failed: Payment record not found for PI ${paymentIntent.id}`);
       return;
     }
-
     payment.status = "failed";
     await payment.save();
     console.log(`✅ Webhook: Updated Payment ${payment._id} to failed status`);
   } catch (err) {
     console.error("❌ handlePaymentIntentFailed error:", err && err.stack ? err.stack : err);
   }
-}
-
-// Helper to normalize card funding
-function normalizeFunding(f) {
-  if (!f) return "unknown";
-  const s = String(f).toLowerCase();
-  if (["credit", "debit", "prepaid"].includes(s)) return s;
-  return "unknown";
 }
 
