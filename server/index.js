@@ -34,10 +34,11 @@ app.use('/uploads', express.static('uploads'));
 
 // Webhook must be mounted BEFORE express.json() to preserve raw body for signature verification
 // Use a permissive type to ensure raw body is available even if Stripe sends a charset
-app.post("/payments/webhook", express.raw({ type: "*/*" }), handleWebhook);
+// MUST BE RAW BODY, MUST MATCH application/json
+app.post("/payments/webhook", express.raw({ type: "application/json" }), handleWebhook);
 
+// After webhook route:
 app.use(express.json());
-
 
 // =======================
 // 🔐 AUTH ROUTES
