@@ -5,9 +5,10 @@ import express from "express";
 import { connectDB } from "./config/db.js";
 
 import { createplan, getallplans, getplanbyid } from "./controller/Plancontroller.js";
-import { login, register } from "./controller/userconroller.js";
+
 import { createCheckoutSession, getPaymentHistory, getPaymentSession, handleWebhook, saveFrontendSession } from "./controller/Paymentcontoller.js";
 import { authMiddleware } from "./middleware/authMiddleware.js";
+import { login, register } from "./controller/Usercontroller.js";
 
 
 
