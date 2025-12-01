@@ -1,6 +1,6 @@
 import Plan from "../model/Plan.js";
 import Payment from "../model/Payment.js";
-import stripePackage from "stripe";
+import Stripe from "stripe";
 
 // Initialize Stripe
 function getStripe() {
@@ -9,8 +9,19 @@ function getStripe() {
     process.env.secret_key ||
     process.env.SECRET_KEY;
 
-  if (!stripeSecret) return null;
-  return stripePackage(stripeSecret);
+  if (!stripeSecret) {
+    console.error("❌ STRIPE_SECRET_KEY not found in environment");
+    return null;
+  }
+  
+  try {
+    const stripe = new Stripe(stripeSecret);
+    console.log("✅ Stripe initialized successfully");
+    return stripe;
+  } catch (err) {
+    console.error("❌ Error initializing Stripe:", err.message);
+    return null;
+  }
 }
 
 // ============================================
@@ -69,8 +80,19 @@ export const createCheckoutSession = async (req, res) => {
         stripePriceId = recurringPrice.id;
         await Plan.findByIdAndUpdate(planId, { stripePriceId });
       } catch (stripeError) {
-        console.error("❌ Error creating Stripe price:", stripeError);
-        return res.status(500).json({ success: false, message: "Failed to create Stripe price" });
+        console.error("❌ Error creating Stripe price:", stripeError.message);
+        console.error("❌ Stripe Error Details:", {
+          type: stripeError.type,
+          code: stripeError.code,
+          param: stripeError.param,
+          statusCode: stripeError.statusCode,
+          message: stripeError.message
+        });
+        return res.status(500).json({ 
+          success: false, 
+          message: "Failed to create Stripe price",
+          error: stripeError.message 
+        });
       }
     }
 
