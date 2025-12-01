@@ -300,344 +300,176 @@ function normalizeFunding(f) {
 }
 
 // Main webhook entry
+// ======================
+// STRIPE WEBHOOK HANDLER
+// ======================
+
 export const handleWebhook = async (req, res) => {
   const sig = req.headers["stripe-signature"];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  if (!webhookSecret) {
-    console.error("❌ STRIPE_WEBHOOK_SECRET not configured");
-    return res.status(500).json({ success: false, message: "Webhook secret not configured" });
-  }
-
   if (!sig) {
-    console.error("❌ No Stripe signature in webhook request");
-    return res.status(400).json({ success: false, message: "Missing Stripe signature" });
+    console.error("❌ Missing Stripe Signature");
+    return res.status(400).send("Missing Stripe Signature");
   }
 
-  const stripe = getStripe(); // get Stripe instance here and pass into handlers if needed
+  if (!webhookSecret) {
+    console.error("❌ STRIPE_WEBHOOK_SECRET missing");
+    return res.status(500).send("Webhook secret missing");
+  }
 
+  const stripe = getStripe();
   let event;
+
   try {
-    // req.body must be the raw Buffer — ensure route used express.raw()
-    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body || {}));
+    const rawBody = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(JSON.stringify(req.body || {}));
+
     event = stripe.webhooks.constructEvent(rawBody, sig, webhookSecret);
-    console.log(`✅ Webhook signature verified, event type: ${event.type}`);
+
+    console.log(`✅ Webhook verified → ${event.type}`);
   } catch (err) {
-    console.error(`❌ Webhook signature verification failed: ${err && err.message ? err.message : err}`);
-    return res.status(400).json({ success: false, message: "Signature verification failed", error: err && err.message ? err.message : String(err) });
+    console.error("❌ Signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
   try {
     switch (event.type) {
-      case "checkout.session.completed":
-        await handleCheckoutSessionCompleted(event.data.object, stripe);
+
+      // REQUIRED PAYMENT EVENTS
+      case "invoice.payment_succeeded":
+        await handleInvoicePaymentSucceeded(event.data.object, stripe);
         break;
 
       case "payment_intent.succeeded":
         await handlePaymentIntentSucceeded(event.data.object, stripe);
         break;
 
-      case "payment_intent.payment_failed":
-        await handlePaymentIntentFailed(event.data.object);
+      case "charge.succeeded":
+        await handleChargeSucceeded(event.data.object, stripe);
         break;
 
-      // Subscription Schedule events
-      case "subscription_schedule.created":
-        await handleSubscriptionScheduleCreated(event.data.object);
+      case "invoice.paid":
+        await handleInvoicePaid(event.data.object, stripe);
         break;
 
-      case "subscription_schedule.completed":
-        await handleSubscriptionScheduleCompleted(event.data.object);
+      // OPTIONAL - subscription info
+      case "customer.subscription.created":
+        console.log("📅 Subscription created:", event.data.object.id);
         break;
 
-      case "subscription_schedule.canceled":
-        await handleSubscriptionScheduleCanceled(event.data.object);
-        break;
-
-      case "subscription_schedule.released":
-        await handleSubscriptionScheduleReleased(event.data.object);
-        break;
-
-      case "subscription_schedule.updated":
-        await handleSubscriptionScheduleUpdated(event.data.object);
-        break;
-
-      case "subscription_schedule.expiring":
-        await handleSubscriptionScheduleExpiring(event.data.object);
+      case "customer.subscription.updated":
+        console.log("🔄 Subscription updated:", event.data.object.id);
         break;
 
       default:
-        console.log(`ℹ️ Unhandled webhook event type: ${event.type}`);
+        console.log(`ℹ️ Skipped event → ${event.type}`);
     }
 
-    return res.json({ success: true, received: true });
+    return res.status(200).json({ success: true });
+
   } catch (err) {
-    console.error(`❌ Error processing webhook event ${event.type}:`, err && err.stack ? err.stack : err);
-    return res.status(500).json({ success: false, message: "Error processing webhook" });
+    console.error(`❌ Error processing event ${event.type}:`, err);
+    return res.status(500).json({ success: false });
   }
 };
 
-// Handle checkout.session.completed event
-async function handleCheckoutSessionCompleted(session, stripe) {
-  try {
-    console.log(`📦 Processing checkout.session.completed: ${session.id}`);
 
-    const planId = session.metadata?.planId;
-    const paymentIntentId = session.payment_intent || null;
 
-    if (!planId) {
-      console.warn("⚠️ checkout.session.completed: no planId in metadata");
-      // still upsert a payment row if you want, but return for now
-      return;
-    }
+// ======================
+// PAYMENT HANDLERS
+// ======================
 
-    // Fetch plan from DB
-    const plan = await Plan.findById(planId);
-    if (!plan) {
-      console.warn(`⚠️ Plan ${planId} not found for checkout session ${session.id}`);
-      return;
-    }
 
-    // Normalize payment data
-    const amountMajor = typeof session.amount_total === "number" ? session.amount_total / 100 : (plan.Price || 0);
-    const currency = (session.currency || process.env.STRIPE_CURRENCY || "inr").toLowerCase();
-    const status = session.payment_status === "paid" ? "succeeded" : "pending";
+// 1️⃣ invoice.payment_succeeded
+async function handleInvoicePaymentSucceeded(invoice, stripe) {
+  console.log("💰 invoice.payment_succeeded:", invoice.id);
 
-    const paymentData = {
-      plan: plan._id,
-      amount: Number(amountMajor) || 0,
-      currency,
-      status,
-      stripeCheckoutSessionId: session.id,
-      stripePaymentIntentId: paymentIntentId,
-      stripePaymentMethodId: null,
-      stripeChargeId: null,
-      cardBrand: null,
-      cardFunding: "unknown",
-      cardLast4: null,
-      cardExpMonth: null,
-      cardExpYear: null,
-      stripeRaw: session,
-    };
+  const paymentIntentId = invoice.payment_intent;
 
-    // Enrich with PaymentIntent data if available
-    if (paymentIntentId && stripe) {
-      try {
-        const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-        if (pi) {
-          if (typeof pi.amount === "number") paymentData.amount = pi.amount / 100;
-          if (pi.currency) paymentData.currency = pi.currency;
-          if (pi.status === "succeeded") paymentData.status = "succeeded";
+  const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+  const charge = pi.charges.data[0];
 
-          const charge = pi.charges?.data?.[0];
-          if (charge) {
-            paymentData.stripeChargeId = charge.id;
-            paymentData.stripePaymentMethodId = charge.payment_method || pi.payment_method;
-            const card = charge.payment_method_details?.card;
-            if (card) {
-              paymentData.cardBrand = card.brand || null;
-              paymentData.cardLast4 = card.last4 || null;
-              paymentData.cardExpMonth = card.exp_month || null;
-              paymentData.cardExpYear = card.exp_year || null;
-              paymentData.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
-            }
-          }
-        }
-      } catch (piErr) {
-        console.warn(`⚠️ Could not retrieve PaymentIntent ${paymentIntentId}:`, piErr && piErr.message ? piErr.message : piErr);
-      }
-    }
+  const paymentData = {
+    amount: invoice.amount_paid / 100,
+    currency: invoice.currency,
+    status: "succeeded",
+    stripePaymentIntentId: paymentIntentId,
+    stripeChargeId: charge.id,
+    stripeSubscriptionId: invoice.subscription,
+    customerId: invoice.customer,
+    cardBrand: charge.payment_method_details.card.brand,
+    cardLast4: charge.payment_method_details.card.last4,
+    createdAt: new Date(invoice.created * 1000),
+    stripeRaw: invoice,
+  };
 
-    // Build filter only with defined keys
-    const or = [];
-    if (paymentIntentId) or.push({ stripePaymentIntentId: paymentIntentId });
-    if (session.id) or.push({ stripeCheckoutSessionId: session.id });
+  await Payment.findOneAndUpdate(
+    { stripePaymentIntentId: paymentIntentId },
+    paymentData,
+    { upsert: true, new: true }
+  );
 
-    const filter = or.length ? { $or: or } : { stripeCheckoutSessionId: session.id };
-
-    // Upsert payment
-    const updated = await Payment.findOneAndUpdate(
-      filter,
-      { $set: paymentData, $setOnInsert: { createdAt: new Date() } },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    if (updated) {
-      console.log(`✅ Webhook: Upserted Payment record for checkout session ${session.id} (id=${updated._id})`);
-    }
-
-    // Optionally update plan status if needed
-    if (paymentData.status === "succeeded") {
-      console.log(`✔ Webhook: Plan ${planId} payment succeeded`);
-      // e.g. await Plan.findByIdAndUpdate(planId, { status: 'active' });
-    }
-  } catch (err) {
-    console.error("❌ handleCheckoutSessionCompleted error:", err && err.stack ? err.stack : err);
-  }
-}
-
-// Handle payment_intent.succeeded event
-async function handlePaymentIntentSucceeded(paymentIntent, stripe) {
-  try {
-    console.log(`💳 Processing payment_intent.succeeded: ${paymentIntent.id}`);
-
-    const chargeId = paymentIntent.charges?.data?.[0]?.id || null;
-
-    let payment = await Payment.findOne({
-      $or: [
-        { stripePaymentIntentId: paymentIntent.id },
-        ...(chargeId ? [{ stripeChargeId: chargeId }] : []),
-      ],
-    });
-
-    // If no payment found, try to create basic payment from PI (use metadata if present)
-    if (!payment) {
-      console.warn(`⚠️ payment_intent.succeeded: Payment record not found for PI ${paymentIntent.id}. Creating new record from PI metadata if possible.`);
-
-      const planId = paymentIntent.metadata?.planId || null;
-      const amount = typeof paymentIntent.amount === "number" ? paymentIntent.amount / 100 : 0;
-      const currency = paymentIntent.currency || process.env.STRIPE_CURRENCY || "inr";
-
-      const newPayment = new Payment({
-        plan: planId ? mongoose.Types.ObjectId(planId) : null,
-        amount,
-        currency,
-        status: "succeeded",
-        stripePaymentIntentId: paymentIntent.id,
-        stripeChargeId: chargeId,
-        stripePaymentMethodId: paymentIntent.payment_method || null,
-        stripeRaw: paymentIntent,
-      });
-
-      const charge = paymentIntent.charges?.data?.[0];
-      if (charge) {
-        const card = charge.payment_method_details?.card;
-        if (card) {
-          newPayment.cardBrand = card.brand || null;
-          newPayment.cardLast4 = card.last4 || null;
-          newPayment.cardExpMonth = card.exp_month || null;
-          newPayment.cardExpYear = card.exp_year || null;
-          newPayment.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
-        }
-      }
-
-      payment = await newPayment.save();
-      console.log(`✅ Webhook: Created new Payment ${payment._id} from PaymentIntent ${paymentIntent.id}`);
-      return;
-    }
-
-    // Update existing payment details
-    payment.status = "succeeded";
-    payment.stripePaymentIntentId = paymentIntent.id;
-    if (!payment.amount && paymentIntent.amount) payment.amount = paymentIntent.amount / 100;
-    if (!payment.currency && paymentIntent.currency) payment.currency = paymentIntent.currency;
-
-    const charge = paymentIntent.charges?.data?.[0];
-    if (charge) {
-      payment.stripeChargeId = charge.id;
-      payment.stripePaymentMethodId = charge.payment_method || paymentIntent.payment_method || payment.stripePaymentMethodId;
-      const card = charge.payment_method_details?.card;
-      if (card) {
-        payment.cardBrand = card.brand || null;
-        payment.cardLast4 = card.last4 || null;
-        payment.cardExpMonth = card.exp_month || null;
-        payment.cardExpYear = card.exp_year || null;
-        payment.cardFunding = card.funding ? normalizeFunding(card.funding) : "unknown";
-      }
-    }
-
-    await payment.save();
-    console.log(`✅ Webhook: Updated Payment ${payment._id} to succeeded`);
-  } catch (err) {
-    console.error("❌ handlePaymentIntentSucceeded error:", err && err.stack ? err.stack : err);
-  }
-}
-
-// Handle payment_intent.payment_failed event
-async function handlePaymentIntentFailed(paymentIntent) {
-  try {
-    console.log(`❌ Processing payment_intent.payment_failed: ${paymentIntent.id}`);
-    const payment = await Payment.findOne({ stripePaymentIntentId: paymentIntent.id });
-    if (!payment) {
-      console.warn(`⚠️ payment_intent.payment_failed: Payment record not found for PI ${paymentIntent.id}`);
-      return;
-    }
-    payment.status = "failed";
-    await payment.save();
-    console.log(`✅ Webhook: Updated Payment ${payment._id} to failed status`);
-  } catch (err) {
-    console.error("❌ handlePaymentIntentFailed error:", err && err.stack ? err.stack : err);
-  }
+  console.log("✅ Payment saved from invoice.payment_succeeded");
 }
 
 
 
-// ============================
-// Subscription Schedule Handlers
-// ============================
+// 2️⃣ payment_intent.succeeded
+async function handlePaymentIntentSucceeded(pi, stripe) {
+  console.log("💳 payment_intent.succeeded:", pi.id);
 
-async function handleSubscriptionScheduleCreated(schedule) {
-  try {
-    console.log(`📘 subscription_schedule.created: id=${schedule.id}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-    // TODO: create subscription record or notify user
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleCreated error:", err && err.stack ? err.stack : err);
-  }
+  const charge = pi.charges.data[0];
+
+  await Payment.findOneAndUpdate(
+    { stripePaymentIntentId: pi.id },
+    {
+      amount: pi.amount / 100,
+      currency: pi.currency,
+      status: "succeeded",
+      stripeChargeId: charge.id,
+      cardBrand: charge.payment_method_details.card.brand,
+      cardLast4: charge.payment_method_details.card.last4,
+      stripeRaw: pi,
+    },
+    { upsert: true }
+  );
+
+  console.log("✅ Payment updated from payment_intent.succeeded");
 }
 
-async function handleSubscriptionScheduleCompleted(schedule) {
-  try {
-    console.log(`✅ subscription_schedule.completed: id=${schedule.id}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-    // TODO: mark subscription phases as active, update local records
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleCompleted error:", err && err.stack ? err.stack : err);
-  }
+
+
+// 3️⃣ charge.succeeded
+async function handleChargeSucceeded(charge) {
+  console.log("💸 charge.succeeded:", charge.id);
+
+  await Payment.findOneAndUpdate(
+    { stripeChargeId: charge.id },
+    {
+      stripePaymentIntentId: charge.payment_intent,
+      status: "succeeded",
+      cardBrand: charge.payment_method_details.card.brand,
+      cardLast4: charge.payment_method_details.card.last4,
+      stripeRaw: charge,
+    },
+    { upsert: true }
+  );
+
+  console.log("✅ Charge saved");
 }
 
-async function handleSubscriptionScheduleCanceled(schedule) {
-  try {
-    console.log(`❌ subscription_schedule.canceled: id=${schedule.id}`);
-    if (schedule.canceled_at) console.log(`→ canceled_at: ${new Date(schedule.canceled_at * 1000).toISOString()}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-    // TODO: handle delinquency or cancellation
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleCanceled error:", err && err.stack ? err.stack : err);
-  }
-}
 
-async function handleSubscriptionScheduleReleased(schedule) {
-  try {
-    console.log(`📤 subscription_schedule.released: id=${schedule.id}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleReleased error:", err && err.stack ? err.stack : err);
-  }
-}
 
-async function handleSubscriptionScheduleUpdated(schedule) {
-  try {
-    console.log(`🔁 subscription_schedule.updated: id=${schedule.id}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleUpdated error:", err && err.stack ? err.stack : err);
-  }
-}
+// 4️⃣ invoice.paid
+async function handleInvoicePaid(invoice) {
+  console.log("🧾 invoice.paid:", invoice.id);
 
-async function handleSubscriptionScheduleExpiring(schedule) {
-  try {
-    console.log(`⏳ subscription_schedule.expiring: id=${schedule.id}`);
-    const planId = schedule.metadata?.planId;
-    if (planId) console.log(`→ metadata.planId: ${planId}`);
-    // TODO: send reminder to customer about upcoming expiry
-  } catch (err) {
-    console.error("❌ handleSubscriptionScheduleExpiring error:", err && err.stack ? err.stack : err);
-  }
-}
+  await Payment.findOneAndUpdate(
+    { stripePaymentIntentId: invoice.payment_intent },
+    { status: "succeeded" }
+  );
 
+  console.log("✅ Invoice marked as paid");
+}
