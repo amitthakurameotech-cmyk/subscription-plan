@@ -6,9 +6,10 @@ import { connectDB } from "./config/db.js";
 
 import { createplan, getallplans, getplanbyid } from "./controller/Plancontroller.js";
 
-import { createCheckoutSession, getPaymentHistory, getPaymentSession, handleWebhook, saveFrontendSession } from "./controller/Paymentcontoller.js";
+
 import { authMiddleware } from "./middleware/authMiddleware.js";
 import { login, register } from "./controller/Usercontroller.js";
+import { createCheckoutSession, getPaymentHistory, getPaymentSession, handleWebhook, saveFrontendSession } from "./controller/Paymentcontoller.js";
 
 
 
@@ -67,5 +68,5 @@ app.post("/payments/save-frontend", saveFrontendSession);
 
 app.listen(PORT, () => {
   connectDB();
-  console.log(` Server is running on PORT: ${PORT}`);
+  console.log(`Server is running on PORT: ${PORT}`);
 });
