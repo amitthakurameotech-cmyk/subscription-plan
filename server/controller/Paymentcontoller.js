@@ -112,6 +112,8 @@ export const createCheckoutSession = async (req, res) => {
       },
     });
 
+
+    
     return res.status(201).json({
       success: true,
       sessionUrl: session.url,
@@ -339,6 +341,31 @@ export const handleWebhook = async (req, res) => {
         await handlePaymentIntentFailed(event.data.object);
         break;
 
+      // Subscription Schedule events
+      case "subscription_schedule.created":
+        await handleSubscriptionScheduleCreated(event.data.object);
+        break;
+
+      case "subscription_schedule.completed":
+        await handleSubscriptionScheduleCompleted(event.data.object);
+        break;
+
+      case "subscription_schedule.canceled":
+        await handleSubscriptionScheduleCanceled(event.data.object);
+        break;
+
+      case "subscription_schedule.released":
+        await handleSubscriptionScheduleReleased(event.data.object);
+        break;
+
+      case "subscription_schedule.updated":
+        await handleSubscriptionScheduleUpdated(event.data.object);
+        break;
+
+      case "subscription_schedule.expiring":
+        await handleSubscriptionScheduleExpiring(event.data.object);
+        break;
+
       default:
         console.log(`ℹ️ Unhandled webhook event type: ${event.type}`);
     }
@@ -540,6 +567,77 @@ async function handlePaymentIntentFailed(paymentIntent) {
     console.log(`✅ Webhook: Updated Payment ${payment._id} to failed status`);
   } catch (err) {
     console.error("❌ handlePaymentIntentFailed error:", err && err.stack ? err.stack : err);
+  }
+}
+
+
+
+// ============================
+// Subscription Schedule Handlers
+// ============================
+
+async function handleSubscriptionScheduleCreated(schedule) {
+  try {
+    console.log(`📘 subscription_schedule.created: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+    // TODO: create subscription record or notify user
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCreated error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleCompleted(schedule) {
+  try {
+    console.log(`✅ subscription_schedule.completed: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+    // TODO: mark subscription phases as active, update local records
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCompleted error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleCanceled(schedule) {
+  try {
+    console.log(`❌ subscription_schedule.canceled: id=${schedule.id}`);
+    if (schedule.canceled_at) console.log(`→ canceled_at: ${new Date(schedule.canceled_at * 1000).toISOString()}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+    // TODO: handle delinquency or cancellation
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCanceled error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleReleased(schedule) {
+  try {
+    console.log(`📤 subscription_schedule.released: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleReleased error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleUpdated(schedule) {
+  try {
+    console.log(`🔁 subscription_schedule.updated: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleUpdated error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleExpiring(schedule) {
+  try {
+    console.log(`⏳ subscription_schedule.expiring: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) console.log(`→ metadata.planId: ${planId}`);
+    // TODO: send reminder to customer about upcoming expiry
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleExpiring error:", err && err.stack ? err.stack : err);
   }
 }
 
