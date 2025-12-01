@@ -1,5 +1,5 @@
 import Plan from "../model/Plan.js";
-import Payment from "../model/payment.js";
+import Payment from "../model/Payment.js";
 import stripePackage from "stripe";
 
 // Initialize Stripe
