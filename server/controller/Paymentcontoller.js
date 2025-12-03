@@ -1,6 +1,7 @@
 import Plan from "../model/Plan.js";
 import Payment from "../model/Payment.js";
 import Stripe from "stripe";
+import User from "../model/User.js";
 
 // Initialize Stripe
 function getStripe() {
@@ -97,7 +98,10 @@ export const createCheckoutSession = async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
+      payment_method_types: [ "card",
+    "upi"
+    
+    ],
       line_items: [
         {
           price: stripePriceId,
@@ -106,7 +110,7 @@ export const createCheckoutSession = async (req, res) => {
       ],
       mode: "subscription",
       success_url: `${frontendUrl}/success?planId=${planId}&sessionId={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/error?cancelled=true`,
+      cancel_url: `${frontendUrl}/error?cancelled=true&sessionId={CHECKOUT_SESSION_ID}`,
       metadata: {
         planId: plan._id.toString(),
       },
@@ -125,6 +129,7 @@ export const createCheckoutSession = async (req, res) => {
     return res.status(500).json({ success: false, message: "Failed to create Stripe session" });
   }
 };
+
 
 // ============================================
 // Get Payment History
@@ -173,6 +178,73 @@ export const getPaymentSession = async (req, res) => {
   } catch (err) {
     console.error("❌ getPaymentSession:", err);
     return res.status(500).json({ success: false, message: "Failed to fetch payment session" });
+  }
+};
+
+// Create or retrieve a Stripe Customer for the logged-in user
+export const createCustomer = async (req, res) => {
+  try {
+    const user = req.user;
+    if (!user) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+    // If user already has a Stripe customer id, return it
+    if (user.stripeCustomerId) {
+      return res.json({ success: true, customerId: user.stripeCustomerId });
+    }
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+
+    const customer = await stripe.customers.create({
+      email: user.email,
+      name: user.fullName || user.name || undefined,
+      metadata: { userId: user._id.toString() },
+    });
+
+    // Save customer id on user record
+    user.stripeCustomerId = customer.id;
+    await user.save();
+
+    return res.json({ success: true, customerId: customer.id });
+  } catch (err) {
+    console.error("❌ createCustomer error:", err && err.message ? err.message : err);
+    return res.status(500).json({ success: false, message: "Failed to create customer", error: err && err.message ? err.message : String(err) });
+  }
+};
+
+// Create PaymentIntent with automatic payment methods enabled (Payment Element + wallets)
+export const createPaymentIntent = async (req, res) => {
+  try {
+    const { planId } = req.params;
+    if (!planId) return res.status(400).json({ success: false, message: "planId is required" });
+
+    const plan = await Plan.findById(planId);
+    if (!plan) return res.status(404).json({ success: false, message: "Plan not found" });
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+
+    const amount = Math.round(parseFloat(plan.Price) * 100);
+    const currency = (process.env.STRIPE_CURRENCY || "inr").toLowerCase();
+
+    // If user is logged in and has a Stripe customer, attach to the PaymentIntent
+    let customerId = null;
+    if (req.user && req.user.stripeCustomerId) {
+      customerId = req.user.stripeCustomerId;
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      customer: customerId || undefined,
+      metadata: { planId: plan._id.toString() },
+    });
+
+    return res.json({ success: true, clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+  } catch (err) {
+    console.error("❌ createPaymentIntent error:", err && err.message ? err.message : err);
+    return res.status(500).json({ success: false, message: "Failed to create PaymentIntent", error: err && err.message ? err.message : String(err) });
   }
 };
 
@@ -291,6 +363,44 @@ export const saveFrontendSession = async (req, res) => {
   }
 };
 
+// Mark a checkout session as cancelled (called from frontend cancel page)
+export const markSessionCanceled = async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    if (!sessionId) return res.status(400).json({ success: false, message: "sessionId required" });
+
+    const stripe = getStripe();
+    if (!stripe) return res.status(500).json({ success: false, message: "Stripe not configured" });
+
+    // Retrieve the session from Stripe
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (!session) return res.status(404).json({ success: false, message: "Session not found" });
+
+    // Build a minimal payment record with canceled status
+    const planId = session.metadata?.planId || null;
+    const amount = typeof session.amount_total === "number" ? session.amount_total / 100 : null;
+    const currency = session.currency || process.env.STRIPE_CURRENCY || "inr";
+
+    const paymentData = {
+      plan: planId || null,
+      amount: amount || 0,
+      currency,
+      status: "canceled",
+      stripeCheckoutSessionId: session.id,
+      stripePaymentIntentId: session.payment_intent || null,
+      stripeRaw: session,
+    };
+
+    const filter = { stripeCheckoutSessionId: session.id };
+    const payment = await Payment.findOneAndUpdate(filter, { $set: paymentData }, { upsert: true, new: true, setDefaultsOnInsert: true });
+
+    return res.json({ success: true, message: "Session marked as canceled", payment });
+  } catch (err) {
+    console.error("❌ markSessionCanceled error:", err && err.stack ? err.stack : err);
+    return res.status(500).json({ success: false, message: "Failed to mark session canceled", error: err && err.message ? err.message : String(err) });
+  }
+};
+
 // Helper to normalize card funding
 function normalizeFunding(f) {
   if (!f) return "unknown";
@@ -361,6 +471,31 @@ export const handleWebhook = async (req, res) => {
 
       case "customer.subscription.updated":
         console.log("🔄 Subscription updated:", event.data.object.id);
+        break;
+
+      // Subscription Schedule events
+      case "subscription_schedule.created":
+        await handleSubscriptionScheduleCreated(event.data.object);
+        break;
+
+      case "subscription_schedule.completed":
+        await handleSubscriptionScheduleCompleted(event.data.object);
+        break;
+
+      case "subscription_schedule.canceled":
+        await handleSubscriptionScheduleCanceled(event.data.object);
+        break;
+
+      case "subscription_schedule.released":
+        await handleSubscriptionScheduleReleased(event.data.object);
+        break;
+
+      case "subscription_schedule.updated":
+        await handleSubscriptionScheduleUpdated(event.data.object);
+        break;
+
+      case "subscription_schedule.expiring":
+        await handleSubscriptionScheduleExpiring(event.data.object);
         break;
 
       default:
@@ -472,4 +607,153 @@ async function handleInvoicePaid(invoice) {
   );
 
   console.log("✅ Invoice marked as paid");
+}
+
+// ============================
+// Subscription Schedule Handlers
+// ============================
+
+async function handleSubscriptionScheduleCreated(schedule) {
+  try {
+    console.log(`📘 subscription_schedule.created: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // Extract current period dates if available in phases
+      if (schedule.phases && schedule.phases.length > 0) {
+        const currentPhase = schedule.phases[0];
+        const updateData = {};
+        
+        if (currentPhase.start_date) {
+          updateData.currentPeriodStart = new Date(currentPhase.start_date * 1000);
+          console.log(`→ currentPeriodStart: ${updateData.currentPeriodStart.toISOString()}`);
+        }
+        
+        if (currentPhase.end_date) {
+          updateData.currentPeriodEnd = new Date(currentPhase.end_date * 1000);
+          console.log(`→ currentPeriodEnd: ${updateData.currentPeriodEnd.toISOString()}`);
+        }
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated with period dates`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCreated error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleCompleted(schedule) {
+  try {
+    console.log(`✅ subscription_schedule.completed: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // On completion, update period dates from the released subscription
+      if (schedule.phases && schedule.phases.length > 0) {
+        const updateData = {};
+        
+        // Use the first phase's dates
+        const phase = schedule.phases[0];
+        if (phase.start_date) {
+          updateData.currentPeriodStart = new Date(phase.start_date * 1000);
+        }
+        if (phase.end_date) {
+          updateData.currentPeriodEnd = new Date(phase.end_date * 1000);
+        }
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated with completed period dates`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCompleted error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleCanceled(schedule) {
+  try {
+    console.log(`❌ subscription_schedule.canceled: id=${schedule.id}`);
+    if (schedule.canceled_at) console.log(`→ canceled_at: ${new Date(schedule.canceled_at * 1000).toISOString()}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // Optionally clear period dates on cancellation or mark a status field
+      // For now, just log — you can add status field if needed
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleCanceled error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleReleased(schedule) {
+  try {
+    console.log(`📤 subscription_schedule.released: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // Extract period dates from the released subscription
+      if (schedule.subscription) {
+        // subscription field contains the active subscription; can query Stripe for billing period
+        // For now, log the subscription ID
+        console.log(`→ subscription: ${schedule.subscription}`);
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleReleased error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleUpdated(schedule) {
+  try {
+    console.log(`🔁 subscription_schedule.updated: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // On update, refresh period dates
+      if (schedule.phases && schedule.phases.length > 0) {
+        const updateData = {};
+        const phase = schedule.phases[0];
+        
+        if (phase.start_date) {
+          updateData.currentPeriodStart = new Date(phase.start_date * 1000);
+        }
+        if (phase.end_date) {
+          updateData.currentPeriodEnd = new Date(phase.end_date * 1000);
+        }
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated with new period dates`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleUpdated error:", err && err.stack ? err.stack : err);
+  }
+}
+
+async function handleSubscriptionScheduleExpiring(schedule) {
+  try {
+    console.log(`⏳ subscription_schedule.expiring: id=${schedule.id}`);
+    const planId = schedule.metadata?.planId;
+    if (planId) {
+      console.log(`→ metadata.planId: ${planId}`);
+      // 7 days before expiry — you can send customer notification here
+      if (schedule.phases && schedule.phases.length > 0) {
+        const phase = schedule.phases[schedule.phases.length - 1];
+        if (phase.end_date) {
+          const expiryDate = new Date(phase.end_date * 1000);
+          console.log(`→ Subscription expiring at: ${expiryDate.toISOString()}`);
+          // TODO: send renewal reminder email to customer
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionScheduleExpiring error:", err && err.stack ? err.stack : err);
+  }
 }

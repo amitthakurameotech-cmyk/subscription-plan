@@ -34,8 +34,7 @@ const PaymentSchema = new mongoose.Schema({
   currency: { type: String, default: "INR" },
 
   // Stripe Billing Cycle Dates
-  currentPeriodStart: { type: Date },
-  currentPeriodEnd: { type: Date },
+  
   status: { type: String, enum: ["pending", "succeeded", "failed", "canceled"], default: "pending" },
 
   // Optional Extra Stripe Fields

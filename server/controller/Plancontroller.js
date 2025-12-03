@@ -18,7 +18,7 @@ export const createplan = async (req, res) => {
     } = req.body;
 
     // Required fields check (without Id)
-    if (!PlanName || !Price || !BillingPeriod || !BillingInterval) {
+    if (!PlanName || !BillingPeriod || !BillingInterval) {
       return res.status(400).send({
         message: "Missing required fields"
       });

@@ -2,12 +2,6 @@ import mongoose from "mongoose";
 
 const PlanSchema = new mongoose.Schema({
 
-  Id: {
-    type: Number,
-    unique: true,
-    sparse: true
-  },
-
   PlanName: {
     type: String,
     required: true
@@ -19,7 +13,8 @@ const PlanSchema = new mongoose.Schema({
 
   Price: {
     type: Number,
-    required: true
+    required: false,
+    default: 0
   },
 
   Currency: {
@@ -58,6 +53,16 @@ const PlanSchema = new mongoose.Schema({
     default: false
   },
 
+  currentPeriodStart: {
+    type: Date,
+    default: null
+  },
+
+  currentPeriodEnd: {
+    type: Date,
+    default: null
+  },
+
   IsActive: {
     type: Boolean,
     default: true
@@ -65,21 +70,9 @@ const PlanSchema = new mongoose.Schema({
 
 },
 
-{ timestamps: true }
+  { timestamps: true }
 );
 
-// Auto-increment Id before saving
-PlanSchema.pre("save", async function (next) {
-  if (this.isNew && !this.Id) {
-    try {
-      const lastPlan = await mongoose.model("Plan").findOne().sort({ Id: -1 });
-      this.Id = lastPlan && lastPlan.Id ? lastPlan.Id + 1 : 1;
-    } catch (error) {
-      return next(error);
-    }
-  }
-  next();
-});
 
 const Plan = mongoose.model("Plan", PlanSchema);
 export default Plan;

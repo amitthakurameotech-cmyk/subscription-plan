@@ -9,7 +9,7 @@ import { createplan, getallplans, getplanbyid } from "./controller/Plancontrolle
 
 import { authMiddleware } from "./middleware/authMiddleware.js";
 import { login, register } from "./controller/Usercontroller.js";
-import { createCheckoutSession, getPaymentHistory, getPaymentSession, handleWebhook, saveFrontendSession } from "./controller/Paymentcontoller.js";
+import { createCheckoutSession, createPaymentIntent, createCustomer, getPaymentHistory, getPaymentSession, handleWebhook, saveFrontendSession, markSessionCanceled } from "./controller/Paymentcontoller.js";
 
 
 
@@ -30,7 +30,7 @@ if (!_webhookSecret) {
 }
 
 app.use(cors());
-app.use('/uploads', express.static('uploads')); 
+app.use('/uploads', express.static('uploads'));
 
 
 app.post(
@@ -44,26 +44,31 @@ app.use(express.json());
 // =======================
 // 🔐 AUTH ROUTES
 // =======================
-app.post("/register",  register);
+app.post("/register", register);
 app.post("/login", login);
 
 
 
 // Create Plan
-app.post("/createplan",createplan );
+app.post("/createplan", createplan);
 
 // Get All Plans
 app.get("/getplans", getallplans);
 
 // Get Plan by ID
-app.get("/getplans/:id", getplanbyid );
+app.get("/getplans/:id", getplanbyid);
 
 
 
 app.post("/payments/create-intent/:planId", authMiddleware, createCheckoutSession);
+app.post("/payments/create-payment-intent/:planId", authMiddleware, createPaymentIntent);
+app.post("/payments/create-customer", authMiddleware, createCustomer);
+
 app.get("/payments/user/:userId", authMiddleware, getPaymentHistory);
 app.get("/payments/session/:sessionId", getPaymentSession);
 app.post("/payments/save-frontend", saveFrontendSession);
+app.post("/payments/cancel/:sessionId", authMiddleware, markSessionCanceled);
+  
 
 // =======================
 // 🚀 SERVER START
