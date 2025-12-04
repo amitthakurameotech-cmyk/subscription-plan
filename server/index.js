@@ -60,14 +60,14 @@ app.get("/getplans/:id", getplanbyid);
 
 
 
-app.post("/payments/create-intent/:planId", authMiddleware, createCheckoutSession);
-app.post("/payments/create-payment-intent/:planId", authMiddleware, createPaymentIntent);
-app.post("/payments/create-customer", authMiddleware, createCustomer);
+app.post("/payments/create-intent/:planId", createCheckoutSession);
+app.post("/payments/create-payment-intent/:planId", createPaymentIntent);
+app.post("/payments/create-customer", createCustomer);
 
-app.get("/payments/user/:userId", authMiddleware, getPaymentHistory);
+app.get("/payments/user/:userId", getPaymentHistory);
 app.get("/payments/session/:sessionId", getPaymentSession);
 app.post("/payments/save-frontend", saveFrontendSession);
-app.post("/payments/cancel/:sessionId", authMiddleware, markSessionCanceled);
+app.post("/payments/cancel/:sessionId", markSessionCanceled);
   
 
 // =======================

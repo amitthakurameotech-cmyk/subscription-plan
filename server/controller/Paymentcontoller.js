@@ -46,6 +46,34 @@ export const createCheckoutSession = async (req, res) => {
 
     let stripePriceId = plan.stripePriceId;
 
+    // If plan is free (amount 0), skip Stripe and create a local payment activation
+    if (amount === 0) {
+      try {
+        const paymentData = {
+          plan: planId,
+          amount: 0,
+          currency: (process.env.STRIPE_CURRENCY || "INR").toUpperCase(),
+          status: "succeeded",
+          stripeRaw: { note: "free plan activation - no Stripe session created" }
+        };
+
+        // Attach user if available
+        if (req.user && req.user._id) paymentData.user = req.user._id;
+
+        const payment = await Payment.create(paymentData);
+
+        return res.status(201).json({
+          success: true,
+          free: true,
+          message: "Free plan activated",
+          payment,
+        });
+      } catch (err) {
+        console.error("❌ createCheckoutSession (free plan) error:", err);
+        return res.status(500).json({ success: false, message: "Failed to activate free plan" });
+      }
+    }
+
     // If no Stripe price ID exists, create a recurring price
     if (!stripePriceId) {
       try {
@@ -226,6 +254,11 @@ export const createPaymentIntent = async (req, res) => {
 
     const amount = Math.round(parseFloat(plan.Price) * 100);
     const currency = (process.env.STRIPE_CURRENCY || "inr").toLowerCase();
+
+    // If plan is free, do not create a PaymentIntent — frontend should skip Payment Element wallets
+    if (amount === 0) {
+      return res.json({ success: true, free: true, message: "Free plan - no PaymentIntent created" });
+    }
 
     // If user is logged in and has a Stripe customer, attach to the PaymentIntent
     let customerId = null;
