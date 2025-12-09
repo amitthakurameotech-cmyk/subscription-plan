@@ -63,6 +63,17 @@ const PlanSchema = new mongoose.Schema({
     default: null
   },
 
+  // Optional explicit plan-level start/end dates (keeps last known activation window)
+  planStartDate: {
+    type: Date,
+    default: null
+  },
+
+  planEndDate: {
+    type: Date,
+    default: null
+  },
+
   IsActive: {
     type: Boolean,
     default: true

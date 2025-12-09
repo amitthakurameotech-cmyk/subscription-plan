@@ -49,11 +49,31 @@ export const createCheckoutSession = async (req, res) => {
     // If plan is free (amount 0), skip Stripe and create a local payment activation
     if (amount === 0) {
       try {
+        // compute period start/end based on plan tenure
+        const now = new Date();
+        let periodStart = now;
+        let periodEnd = new Date(now);
+        try {
+          const bp = (plan.BillingPeriod || "monthly").toString().toLowerCase();
+          const interval = Number(plan.BillingInterval) || 1;
+          if (bp === "monthly") {
+            periodEnd.setMonth(periodEnd.getMonth() + interval);
+          } else {
+            // treat anything else as yearly
+            periodEnd.setFullYear(periodEnd.getFullYear() + interval);
+          }
+        } catch (e) {
+          periodEnd = new Date(now);
+          periodEnd.setMonth(periodEnd.getMonth() + 1);
+        }
+
         const paymentData = {
           plan: planId,
           amount: 0,
           currency: (process.env.STRIPE_CURRENCY || "INR").toUpperCase(),
           status: "succeeded",
+          periodStart,
+          periodEnd,
           stripeRaw: { note: "free plan activation - no Stripe session created" }
         };
 
@@ -61,6 +81,14 @@ export const createCheckoutSession = async (req, res) => {
         if (req.user && req.user._id) paymentData.user = req.user._id;
 
         const payment = await Payment.create(paymentData);
+
+        // Update plan's stored dates so the plan reflects last activation window
+        await Plan.findByIdAndUpdate(planId, {
+          planStartDate: periodStart,
+          planEndDate: periodEnd,
+          currentPeriodStart: periodStart,
+          currentPeriodEnd: periodEnd
+        });
 
         return res.status(201).json({
           success: true,
@@ -73,6 +101,7 @@ export const createCheckoutSession = async (req, res) => {
         return res.status(500).json({ success: false, message: "Failed to activate free plan" });
       }
     }
+
 
     // If no Stripe price ID exists, create a recurring price
     if (!stripePriceId) {
@@ -384,8 +413,18 @@ export const saveFrontendSession = async (req, res) => {
     console.log(`✅ Frontend save: Payment record ${payment._id ? "created" : "updated"} with all fields for plan ${planId}`);
 
     if (status === "succeeded") {
-      // Optional: Update plan status if needed
-      // await Plan.findByIdAndUpdate(planId, { planStatus: "Active" });
+      try {
+        const updateData = {};
+        if (payment.periodStart) updateData.planStartDate = payment.periodStart, updateData.currentPeriodStart = payment.periodStart;
+        if (payment.periodEnd) updateData.planEndDate = payment.periodEnd, updateData.currentPeriodEnd = payment.periodEnd;
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated from frontend session with period dates`);
+        }
+      } catch (e) {
+        console.warn("⚠️ Could not update Plan from frontend session:", e && e.message ? e.message : e);
+      }
     }
 
     return res.json({ success: true, payment, plan });
@@ -499,7 +538,8 @@ export const handleWebhook = async (req, res) => {
 
       // OPTIONAL - subscription info
       case "customer.subscription.created":
-        console.log("📅 Subscription created:", event.data.object.id);
+        await handleSubscriptionCreated(event.data.object, stripe);
+        break;
         break;
 
       case "customer.subscription.updated":
@@ -573,13 +613,106 @@ async function handleInvoicePaymentSucceeded(invoice, stripe) {
     stripeRaw: invoice,
   };
 
-  await Payment.findOneAndUpdate(
-    { stripePaymentIntentId: paymentIntentId },
-    paymentData,
-    { upsert: true, new: true }
-  );
+  // If this invoice is tied to a subscription, fetch subscription to get period dates and plan metadata
+  try {
+    if (invoice.subscription) {
+      const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
 
-  console.log("✅ Payment saved from invoice.payment_succeeded");
+      // extract period dates from subscription
+      if (subscription.current_period_start) paymentData.periodStart = new Date(subscription.current_period_start * 1000);
+      if (subscription.current_period_end) paymentData.periodEnd = new Date(subscription.current_period_end * 1000);
+
+      // prefer metadata on subscription, then on price item
+      let planId = subscription.metadata?.planId || null;
+      if (!planId) {
+        const item = subscription.items?.data?.[0];
+        planId = item?.price?.metadata?.planId || null;
+      }
+
+      // Save or update payment record including period dates
+      const payment = await Payment.findOneAndUpdate(
+        { stripePaymentIntentId: paymentIntentId },
+        paymentData,
+        { upsert: true, new: true }
+      );
+
+      // If we can determine a plan id, update Plan's period fields accordingly
+      if (planId) {
+        const updateData = {};
+        if (paymentData.periodStart) updateData.planStartDate = paymentData.periodStart, updateData.currentPeriodStart = paymentData.periodStart;
+        if (paymentData.periodEnd) updateData.planEndDate = paymentData.periodEnd, updateData.currentPeriodEnd = paymentData.periodEnd;
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated with period from invoice.payment_succeeded`);
+        }
+      }
+    } else {
+      // Not a subscription invoice — simply upsert payment
+      await Payment.findOneAndUpdate(
+        { stripePaymentIntentId: paymentIntentId },
+        paymentData,
+        { upsert: true, new: true }
+      );
+    }
+
+    console.log("✅ Payment saved from invoice.payment_succeeded");
+  } catch (err) {
+    console.error("❌ Error processing invoice.subscription data:", err && err.stack ? err.stack : err);
+    // fallback: still save payment without period info
+    await Payment.findOneAndUpdate(
+      { stripePaymentIntentId: paymentIntentId },
+      paymentData,
+      { upsert: true, new: true }
+    );
+  }
+}
+
+
+// When a subscription is created in Stripe, update the linked plan with period dates
+async function handleSubscriptionCreated(subscription, stripe) {
+  try {
+    console.log("📅 customer.subscription.created:", subscription.id);
+
+    // Try to get planId from several possible places
+    let planId = subscription.metadata?.planId || null;
+
+    if (!planId) {
+      // Try items -> price -> metadata
+      const item = subscription.items?.data?.[0];
+      planId = item?.price?.metadata?.planId || null;
+    }
+
+    // Update Payment(s) that reference this subscription
+    if (subscription.id) {
+      const periodStart = subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null;
+      const periodEnd = subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null;
+
+      await Payment.updateMany(
+        { stripeSubscriptionId: subscription.id },
+        {
+          stripeSubscriptionId: subscription.id,
+          periodStart,
+          periodEnd,
+          status: subscription.status === "active" ? "succeeded" : undefined,
+          stripeRaw: subscription
+        }
+      );
+
+      if (planId) {
+        const updateData = {};
+        if (periodStart) updateData.planStartDate = periodStart, updateData.currentPeriodStart = periodStart;
+        if (periodEnd) updateData.planEndDate = periodEnd, updateData.currentPeriodEnd = periodEnd;
+
+        if (Object.keys(updateData).length > 0) {
+          await Plan.findByIdAndUpdate(planId, updateData);
+          console.log(`✅ Plan ${planId} updated from subscription.created with dates`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("❌ handleSubscriptionCreated error:", err && err.stack ? err.stack : err);
+  }
 }
 
 
